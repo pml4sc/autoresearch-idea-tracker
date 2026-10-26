@@ -238,7 +238,7 @@ where n.nspname = 'public' and p.proname in
 ### How invitation onboarding works
 
 1. The administrator invites a member from the Supabase Dashboard. The tracker has no invitation UI and never uses the `service_role` key; the publishable key is enough for everything the page does.
-2. Supabase emails the member a one-time link to `https://anthonyzhangyan.github.io/autoresearch-idea-tracker/`.
+2. Supabase emails the member a one-time link to `https://pml4sc.github.io/autoresearch-idea-tracker/`.
 3. The page detects the callback, removes the one-time credentials from the address bar (keeping the `/autoresearch-idea-tracker/` path), and establishes the session **once** with the SDK:
    - `?token_hash=…&type=invite` (recommended template, C below) → `supabase.auth.verifyOtp({token_hash, type:'invite'})`
    - `#access_token=…&refresh_token=…&type=invite` (default template) → `supabase.auth.setSession(...)`, which validates the token with Supabase Auth
@@ -257,7 +257,7 @@ Invitations work while **Allow new users to sign up** is off. Keep it off.
 **Authentication → URL Configuration → Site URL**:
 
 ```text
-https://anthonyzhangyan.github.io/autoresearch-idea-tracker/
+https://pml4sc.github.io/autoresearch-idea-tracker/
 ```
 
 Use exactly this value: `https`, the repository subpath, and the trailing slash. Dashboard invitations have no per-invite redirect option, so Supabase returns invited members to the Site URL. Save, then reload the page and confirm the value.
@@ -267,7 +267,7 @@ Use exactly this value: `https`, the repository subpath, and the trailing slash.
 On the same page, under **Redirect URLs → Add URL**, add:
 
 ```text
-https://anthonyzhangyan.github.io/autoresearch-idea-tracker/
+https://pml4sc.github.io/autoresearch-idea-tracker/
 ```
 
 Add these only if you test the invitation flow against a local server (section 5):
@@ -277,7 +277,7 @@ http://localhost:8000/
 http://127.0.0.1:8000/
 ```
 
-Supabase only redirects to allow-listed URLs and otherwise falls back to the Site URL. Use exact URLs; avoid wildcards for production. The app is a single page with no `/auth/callback` route, so every callback goes to the repository root shown above. Do not add `https://anthonyzhangyan.github.io/` alone: it is a different site.
+Supabase only redirects to allow-listed URLs and otherwise falls back to the Site URL. Use exact URLs; avoid wildcards for production. The app is a single page with no `/auth/callback` route, so every callback goes to the repository root shown above. Do not add `https://pml4sc.github.io/` alone: it is a different site.
 
 ### C. Invitation email
 
@@ -288,7 +288,7 @@ Supabase only redirects to allow-listed URLs and otherwise falls back to the Sit
 ```html
 <h2>You have been invited to the PML4SC Lab AutoResearch Idea Tracker</h2>
 <p>Follow this link to accept the invitation and create your password:</p>
-<p><a href="https://anthonyzhangyan.github.io/autoresearch-idea-tracker/?token_hash={{ .TokenHash }}&type=invite">Accept the invitation</a></p>
+<p><a href="https://pml4sc.github.io/autoresearch-idea-tracker/?token_hash={{ .TokenHash }}&type=invite">Accept the invitation</a></p>
 ```
 
 Why: with the default `{{ .ConfirmationURL }}`, Supabase consumes the one-time token at its `/verify` endpoint as soon as the link is fetched. University and corporate mail scanners (for example Safe Links) often pre-open links, which can use up the invitation before the member clicks it. With the template above, the token is consumed only when the tracker page runs in the member's browser. The URL is written out in full so it does not depend on whether the Site URL has a trailing slash. `{{ .SiteURL }}?token_hash={{ .TokenHash }}&type=invite` is equivalent if the Site URL is exactly as in A.
@@ -314,7 +314,7 @@ The members **do not need Supabase Dashboard accounts**, and the administrator n
 
 ### Configuration order
 
-1. **Deploy the frontend** to GitHub Pages (section 8) and confirm the page loads at `https://anthonyzhangyan.github.io/autoresearch-idea-tracker/`.
+1. **Deploy the frontend** to GitHub Pages (section 8) and confirm the page loads at `https://pml4sc.github.io/autoresearch-idea-tracker/`.
 2. **Configure the Site URL and Redirect URLs** (section 2 A–B).
 3. **Configure the invitation email flow** (section 2 C): template, SMTP, link lifetime, password length.
 4. **Invite the members** through the Supabase Dashboard (below). Invite yourself or one member first and complete the flow before inviting the rest.
@@ -482,7 +482,7 @@ await state.client.rpc('remove_comment', {p_comment_id:'<ANOTHER_AUTHORS_COMMENT
 
 Use a real address you control first, ideally your own, before inviting the other members.
 
-1. Invite the address from the Dashboard and open the email in a **private window**. Confirm the link points to `https://anthonyzhangyan.github.io/autoresearch-idea-tracker/`. After clicking, the address bar must show that URL with no `token_hash`, `access_token`, or `code` left in it.
+1. Invite the address from the Dashboard and open the email in a **private window**. Confirm the link points to `https://pml4sc.github.io/autoresearch-idea-tracker/`. After clicking, the address bar must show that URL with no `token_hash`, `access_token`, or `code` left in it.
 2. Confirm **Set Your Password** appears, with the invited email shown read-only. Check that mismatched or too-short passwords are rejected without a request, and that Show passwords works.
 3. Create the password. Confirm "Your password has been created successfully." and either **Enter the tracker** (profile active) or the "not yet authorized" message (no profile).
 4. Reload: onboarding must not reappear. Log out, then sign in with the email and new password.
@@ -684,7 +684,7 @@ Nothing below has been done. The database and frontend must change together: the
 2. **Tell the members** to close the tracker for a few minutes.
 3. **Database**: follow section 1B: export, verify the backup offline, paste the fingerprint and run `schema.sql` once, then run the verification queries.
 4. **Frontend**: `git push origin main`. GitHub Pages (Settings → Pages → Deploy from a branch, `main`, `/ (root)`) republishes automatically; wait for the Pages workflow to succeed.
-5. **Open** https://anthonyzhangyan.github.io/autoresearch-idea-tracker/ with a hard reload (Ctrl+Shift+R / Cmd+Shift+R) so no cached V1 page remains. Ask each member to do the same.
+5. **Open** https://pml4sc.github.io/autoresearch-idea-tracker/ with a hard reload (Ctrl+Shift+R / Cmd+Shift+R) so no cached V1 page remains. Ask each member to do the same.
 6. **Smoke test** with two members: publish a disposable idea, both join, both submit different results, post comments, PI reopens one result, PI deletes the idea. Check that everything appears in both sessions without Refresh, and in History. Then run the remaining section 6 checks.
 
 If step 3 fails, nothing was changed; fix the cause and rerun the failed file. If it succeeds but you must stop before step 4, the V1 page shows a "database setup" error until V2 is deployed; no member data is at risk.
