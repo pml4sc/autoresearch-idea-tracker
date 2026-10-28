@@ -32,9 +32,9 @@ try {
   await db.initialise(); await db.start();
   const admin = db.getPgClient(); await admin.connect(); clients.push(admin);
   await admin.query(`create role anon nologin; create role authenticated nologin; ${authStub}`);
-  const [schema, exportSQL, dropArchiveSQL, v1Schema, repliesMigration, v20Schema, creatorDeleteMigration, notifyMigration, authorDeleteMigration, resultEditMigration, limitMigration, imagesMigration] = await Promise.all([read('../supabase/schema.sql'),read('../supabase/export_v1_backup.sql'),
-    read('../supabase/drop_v1_archive.sql'),read('./fixtures/schema_v1.sql'),read('../supabase/migrations/add_comment_replies.sql'),read('./fixtures/schema_v2_0.sql'),read('../supabase/migrations/allow_creator_delete_untouched_idea.sql'),read('../supabase/migrations/add_notification_reads.sql'),read('../supabase/migrations/allow_comment_author_delete.sql'),read('../supabase/migrations/allow_member_update_result.sql'),read('../supabase/migrations/raise_description_limit.sql'),read('../supabase/migrations/add_comment_images.sql')]);
-  for (const [name,sql] of [['schema.sql',schema],['export',exportSQL],['archive cleanup',dropArchiveSQL],['replies migration',repliesMigration],['author deletion migration',authorDeleteMigration],['creator deletion migration',creatorDeleteMigration],['notification migration',notifyMigration],['result edit migration',resultEditMigration],['description limit migration',limitMigration],['comment image migration',imagesMigration]]) {
+  const [schema, exportSQL, dropArchiveSQL, v1Schema, repliesMigration, v20Schema, creatorDeleteMigration, notifyMigration, authorDeleteMigration, resultEditMigration, limitMigration, imagesMigration, archiveMigration, reopenMigration] = await Promise.all([read('../supabase/schema.sql'),read('../supabase/export_v1_backup.sql'),
+    read('../supabase/drop_v1_archive.sql'),read('./fixtures/schema_v1.sql'),read('../supabase/migrations/add_comment_replies.sql'),read('./fixtures/schema_v2_0.sql'),read('../supabase/migrations/allow_creator_delete_untouched_idea.sql'),read('../supabase/migrations/add_notification_reads.sql'),read('../supabase/migrations/allow_comment_author_delete.sql'),read('../supabase/migrations/allow_member_update_result.sql'),read('../supabase/migrations/raise_description_limit.sql'),read('../supabase/migrations/add_comment_images.sql'),read('../supabase/migrations/add_idea_archive.sql'),read('../supabase/migrations/allow_member_reopen_own_result.sql')]);
+  for (const [name,sql] of [['schema.sql',schema],['export',exportSQL],['archive cleanup',dropArchiveSQL],['replies migration',repliesMigration],['author deletion migration',authorDeleteMigration],['creator deletion migration',creatorDeleteMigration],['notification migration',notifyMigration],['result edit migration',resultEditMigration],['description limit migration',limitMigration],['comment image migration',imagesMigration],['archive migration',archiveMigration],['reopen migration',reopenMigration]]) {
     check(/```|\\[_*<>]|&(?:lt|gt);/.test(sql),false,`${name} is plain SQL, not escaped Markdown`);
     check(/\bcascade\b/i.test(sql.replace(/--.*$/gm,'')),false,`${name} uses no CASCADE`);
   }
@@ -52,11 +52,11 @@ try {
   check((await admin.query("select count(*)::int n from pg_constraint where contype='f' and connamespace='public'::regnamespace and confdeltype='c'")).rows[0].n,0,'no ON DELETE CASCADE foreign keys');
   check((await admin.query("select count(*)::int n from information_schema.columns where table_schema='public' and table_name='ideas' and column_name in ('status','assigned_to','result','notes','experiment_url','completed_at')")).rows[0].n,0,'no single-assignee columns on ideas');
   check((await admin.query("select count(*)::int n from pg_proc where proname in ('claim_idea','release_idea','complete_idea','reopen_idea')")).rows[0].n,0,'no V1 RPCs');
-  const rpcNames = ['create_idea','update_idea','delete_idea','join_idea','leave_idea','submit_result','reopen_result','add_comment','reply_to_comment','remove_comment','mark_notifications_read'];
+  const rpcNames = ['create_idea','update_idea','delete_idea','join_idea','leave_idea','submit_result','reopen_result','add_comment','reply_to_comment','remove_comment','mark_notifications_read','archive_idea','unarchive_idea'];
   const acl = await admin.query(`select p.proname, has_function_privilege('anon',p.oid,'EXECUTE') as anon,
     has_function_privilege('authenticated',p.oid,'EXECUTE') as member, p.proconfig, p.prosecdef
     from pg_proc p where p.pronamespace='public'::regnamespace and p.proname = any($1)`,[rpcNames]);
-  check(acl.rows.map(r => r.proname).sort(),[...rpcNames].sort(),'eleven V2 RPCs');
+  check(acl.rows.map(r => r.proname).sort(),[...rpcNames].sort(),'thirteen V2 RPCs');
   for (const fn of acl.rows) check([fn.anon,fn.member,fn.prosecdef,fn.proconfig.includes('search_path=""')],[false,true,true,true],`${fn.proname}: grants and fixed search path`);
   check((await admin.query("select pg_get_function_identity_arguments('public.submit_result'::regproc)")).rows[0].pg_get_function_identity_arguments,
     'p_idea_id uuid, p_expected_revision bigint, p_result text, p_notes text, p_experiment_url text','submit_result has no member parameter');
@@ -168,6 +168,15 @@ try {
   check([reopenEvent.event_type,reopenEvent.member_id,reopenEvent.actor_id,reopenEvent.previous_state.result,reopenEvent.previous_state.notes],
     ['result_reopened',users.Yan,users.Shibo,'success','Yan notes'],'previous result preserved in history');
   await rpc(yan,'submit_result',[target,reopened.revision,'fail','Second trial',null]);
+  // A member may move their own result back to Testing, never someone else's.
+  const ownBack = await rpc(yan,'reopen_result',[target,users.Yan,(await part(target,'Yan')).revision]);
+  check([ownBack.status,ownBack.result,ownBack.notes],['testing',null,null],'member moves own result back to Testing');
+  const ownBackEvent = (await events(target)).at(-1);
+  check([ownBackEvent.event_type,ownBackEvent.actor_id,ownBackEvent.member_id,ownBackEvent.previous_state.result,ownBackEvent.previous_state.notes],
+    ['result_reopened',users.Yan,users.Yan,'fail','Second trial'],'own reopen keeps the previous result in history');
+  await rejects(() => rpc(yan,'reopen_result',[target,users.Yan,ownBack.revision]),/Invalid status transition/,'a Testing row cannot be reopened');
+  await rejects(() => rpc(outsider,'reopen_result',[target,users.Junqi,junqiRow.revision]),/Permission denied/,'outsider cannot reopen');
+  await rpc(yan,'submit_result',[target,ownBack.revision,'fail','Second trial',null]);
 
   // ---- A member changes their own completed result; history keeps both states.
   const secondTrial = await part(target,'Yan');
@@ -506,6 +515,50 @@ try {
   await yan.query('commit');
   check([(await part(shared.id,'Yan')).result,(await part(shared.id,'Junqi')).result,(await idea(shared.id)).title],['success','fail','Edited during a submission'],'all concurrent changes kept');
 
+  // ---- Archive: creator or PI, optional reason, no joins while archived, reversible.
+  const dead = await create(yan,'Idea that did not work');
+  await rpc(junqi,'join_idea',[dead.id]);
+  await rejects(() => rpc(junqi,'archive_idea',[dead.id,dead.revision,null]),/only the PI or the idea creator can archive/,'participant cannot archive another member\'s idea');
+  await rejects(() => rpc(outsider,'archive_idea',[dead.id,dead.revision,null]),/Permission denied/,'outsider cannot archive');
+  await rejects(() => rpc(anon,'archive_idea',[dead.id,dead.revision,null]),/permission denied/,'anon cannot archive');
+  const archived = await rpc(yan,'archive_idea',[dead.id,dead.revision,'  Baseline already beats it  ']);
+  check([archived.archived_by,archived.archive_reason,archived.archived_at !== null,Number(archived.revision)],[users.Yan,'Baseline already beats it',true,Number(dead.revision) + 1],'creator archives with a trimmed reason');
+  await rejects(() => rpc(yan,'archive_idea',[dead.id,dead.revision,null]),/Idea changed/,'stale archive rejected');
+  await rejects(() => rpc(yan,'archive_idea',[dead.id,archived.revision,null]),/Idea already archived/,'cannot archive twice');
+  await rejects(() => rpc(yifan,'join_idea',[dead.id]),/This idea is archived/,'nobody can join an archived idea');
+  await rpc(junqi,'leave_idea',[dead.id,(await part(dead.id,'Junqi')).revision]);
+  await rejects(() => rpc(junqi,'join_idea',[dead.id]),/This idea is archived/,'nobody can rejoin an archived idea');
+  check((await rpc(yifan,'add_comment',[dead.id,'Why it failed',randomUUID()])).idea_id,dead.id,'archived ideas keep their discussion open');
+  const archivedEdit = await rpc(yan,'update_idea',[dead.id,archived.revision,'Idea that did not work (notes)','','2026-10-12','low']);
+  check([archivedEdit.archived_at !== null,archivedEdit.archive_reason],[true,'Baseline already beats it'],'editing an archived idea keeps it archived');
+  await rejects(() => rpc(junqi,'unarchive_idea',[dead.id,archivedEdit.revision]),/only the PI or the idea creator can restore/,'others cannot restore');
+  const restored = await rpc(shibo,'unarchive_idea',[dead.id,archivedEdit.revision]);
+  check([restored.archived_at,restored.archived_by,restored.archive_reason],[null,null,null],'PI restores any idea');
+  await rejects(() => rpc(shibo,'unarchive_idea',[dead.id,restored.revision]),/Idea is not archived/,'cannot restore an active idea');
+  check((await rpc(junqi,'join_idea',[dead.id])).status,'testing','a restored idea can be joined again');
+  check((await events(dead.id)).map(e => e.event_type).filter(t => ['archived','edited','unarchived'].includes(t)),['archived','edited','unarchived'],'archive and restore have their own history events');
+  check((await events(dead.id)).find(e => e.event_type === 'archived').new_state.archive_reason,'Baseline already beats it','the reason stays in history after restoring');
+  const blank = await rpc(shibo,'archive_idea',[restored.id,restored.revision,'   ']);
+  check(blank.archive_reason,null,'a blank reason is stored as no reason');
+  const yanRevision = (await idea(yanIdea.id)).revision;
+  await rejects(() => rpc(shibo,'archive_idea',[yanIdea.id,yanRevision,'x'.repeat(2001)]),/idea_archive_state/,'reason limited to 2000 characters');
+  await rejects(() => admin.query('update public.ideas set archived_at=now() where id=$1',[yanIdea.id]),/idea_archive_state/,'archive columns stay consistent');
+  // Join and archive race: whichever commits first wins, never both silently.
+  const raced = await create(shibo,'Archive while someone joins');
+  await yan.query('begin');
+  await rpc(yan,'join_idea',[raced.id]);
+  const archiving = rpc(shiboDeleter,'archive_idea',[raced.id,raced.revision,null]);
+  check(await settlesWithin(archiving,300),'pending','archive waits for an uncommitted join');
+  await yan.query('commit'); await archiving;
+  check((await part(raced.id,'Yan')).status,'testing','the earlier join is kept');
+  const raced2 = await create(shibo,'Join while archiving');
+  await shiboDeleter.query('begin');
+  await rpc(shiboDeleter,'archive_idea',[raced2.id,raced2.revision,null]);
+  const lateJoin = rpc(yan,'join_idea',[raced2.id]).then(value => ({value}),error => ({error}));
+  check(await settlesWithin(lateJoin,300),'pending','a join waits for an uncommitted archive');
+  await shiboDeleter.query('commit');
+  check((await lateJoin).error?.message,'This idea is archived','a join after the archive is refused');
+
   // ---- Rerun keeps all V2 data.
   const counts = async () => (await admin.query('select (select count(*) from public.ideas)::int i,(select count(*) from public.idea_participants)::int p,(select count(*) from public.idea_comments)::int c,(select count(*) from public.idea_events)::int e')).rows[0];
   const beforeRerun = await counts();
@@ -770,6 +823,52 @@ try {
   check(Number(grown.revision),Number(limitIdea.revision) + 1,'migrated: an existing idea can grow beyond 100 KiB');
   check((await live.query("select new_state->>'description' = $2 same from public.idea_events where idea_id=$1 and event_type='edited' order by id desc limit 1",[limitIdea.id,overOld])).rows[0].same,true,'history keeps the full larger description');
   await rejects(() => rpc(liveShibo,'update_idea',[limitIdea.id,grown.revision,limitIdea.title,atLimit + 'x','2026-10-12','high']),/ideas_description_check/,'migrated: edits above 1 MiB rejected');
+  // ---- Archive migration on the deployed schema + every earlier migration.
+  const archiveCatalog = async client => (await client.query(`select
+    (select string_agg(column_name || ' ' || data_type || ' ' || is_nullable, ',' order by ordinal_position) from information_schema.columns where table_schema='public' and table_name='ideas') columns,
+    (select string_agg(conname || ':' || pg_get_constraintdef(oid), ' | ' order by conname) from pg_constraint where conrelid in ('public.ideas'::regclass,'public.idea_events'::regclass)) constraints,
+    (select string_agg(p.proname || ':' || md5(pg_get_functiondef(p.oid)) || ':' || has_function_privilege('authenticated',p.oid,'EXECUTE') || has_function_privilege('anon',p.oid,'EXECUTE'), ',' order by p.proname)
+      from pg_proc p where p.proname in ('archive_idea','unarchive_idea','join_idea','audit_idea')) functions`)).rows[0];
+  // Existing ideas gain three null columns; everything else must stay byte-identical.
+  const archiveData = async () => ({...await dataSnapshot(),ideas:(await live.query(`select md5(string_agg((to_jsonb(i) - 'archived_at' - 'archived_by' - 'archive_reason')::text, ',' order by i.id)) h from public.ideas i`)).rows[0].h});
+  const beforeArchiveMigration = await archiveData(), oldArchiveCatalog = await archiveCatalog(live);
+  check((await live.query("select to_regprocedure('public.archive_idea(uuid,bigint,text)') r")).rows[0].r,null,'deployed V2 has no archive RPC yet');
+  await rejects(() => live.query(archiveMigration.replace(/commit;\s*$/i,()=>"do $$ begin raise exception 'Injected migration failure'; end; $$; commit;")),/Injected migration failure/,'archive migration is transactional');
+  await live.query('rollback');
+  check([await archiveCatalog(live),await archiveData()],[oldArchiveCatalog,beforeArchiveMigration],'failed archive migration changes no column, function or data');
+  await live.query(archiveMigration);
+  check(await archiveData(),beforeArchiveMigration,'archive migration preserves every idea, result, comment and event');
+  check((await live.query('select count(*)::int n from public.ideas where archived_at is not null or archived_by is not null or archive_reason is not null')).rows[0].n,0,'existing ideas stay active');
+  check(await policySnapshot(),beforePolicies,'RLS policies unchanged by the archive migration');
+  await live.query(archiveMigration);
+  check(await archiveData(),beforeArchiveMigration,'repeating the archive migration preserves all data');
+  check(await archiveCatalog(live),await archiveCatalog(admin),'migrated and freshly installed archive columns, constraints and functions are identical');
+  const liveArchived = await rpc(liveShibo,'archive_idea',[limitIdea.id,grown.revision,'Superseded']);
+  check([liveArchived.archive_reason,liveArchived.archived_by],['Superseded',users.Shibo],'migrated RPC archives a pre-existing idea');
+  await rejects(() => rpc(liveYan,'join_idea',[limitIdea.id]),/This idea is archived/,'migrated join_idea refuses archived ideas');
+  await rejects(() => rpc(liveYan,'unarchive_idea',[limitIdea.id,liveArchived.revision]),/only the PI or the idea creator can restore/,'migrated: only creator or PI restores');
+  const liveRestored = await rpc(liveShibo,'unarchive_idea',[limitIdea.id,liveArchived.revision]);
+  check((await live.query("select event_type from public.idea_events where idea_id=$1 order by id desc limit 2",[limitIdea.id])).rows.map(r => r.event_type),['unarchived','archived'],'migrated history records archive and restore');
+  check((await rpc(liveYan,'join_idea',[limitIdea.id])).status,'testing','migrated: a restored idea can be joined');
+  check(liveRestored.archived_at,null,'migrated RPC restores the idea');
+  // ---- Own-reopen migration on the deployed schema + every earlier migration.
+  const reopenDefinition = async client => (await client.query(`select md5(pg_get_functiondef('public.reopen_result(uuid,uuid,bigint)'::regprocedure))
+    || has_function_privilege('authenticated','public.reopen_result(uuid,uuid,bigint)','EXECUTE')
+    || has_function_privilege('anon','public.reopen_result(uuid,uuid,bigint)','EXECUTE') d`)).rows[0].d;
+  const junqiDone = await live.query('select revision from public.idea_participants where idea_id=$1 and member_id=$2',[resultIdea.id,users.Junqi]);
+  await rejects(() => rpc(liveJunqi,'reopen_result',[resultIdea.id,users.Junqi,junqiDone.rows[0].revision]),/Permission denied/,'deployed RPC: only the PI reopens');
+  const beforeReopenMigration = await dataSnapshot(), oldReopenDefinition = await reopenDefinition(live);
+  await rejects(() => live.query(reopenMigration.replace(/commit;\s*$/i,()=>"do $$ begin raise exception 'Injected migration failure'; end; $$; commit;")),/Injected migration failure/,'reopen migration is transactional');
+  await live.query('rollback');
+  check([await reopenDefinition(live),await dataSnapshot()],[oldReopenDefinition,beforeReopenMigration],'failed reopen migration restores the old function and changes no data');
+  await live.query(reopenMigration);
+  check(await dataSnapshot(),beforeReopenMigration,'reopen migration preserves every row, result and event');
+  check(await policySnapshot(),beforePolicies,'RLS policies unchanged by the reopen migration');
+  await live.query(reopenMigration);
+  check(await dataSnapshot(),beforeReopenMigration,'repeating the reopen migration preserves all data');
+  check(await reopenDefinition(live),await reopenDefinition(admin),'migrated and freshly installed reopen_result are identical');
+  await rejects(() => rpc(liveYan,'reopen_result',[resultIdea.id,users.Junqi,junqiDone.rows[0].revision]),/Permission denied/,'migrated RPC: others still cannot reopen');
+  check((await rpc(liveJunqi,'reopen_result',[resultIdea.id,users.Junqi,junqiDone.rows[0].revision])).status,'testing','migrated RPC: member moves a pre-existing result back to Testing');
   const afterAuthorDeletes = await dataSnapshot();
   await live.query(authorDeleteMigration);
   check(await dataSnapshot(),afterAuthorDeletes,'rerun preserves removals and history');
@@ -843,6 +942,10 @@ try {
   await notV2.query('rollback');
   await rejects(() => notV2.query(imagesMigration),/requires the V2 schema/,'comment-image migration refuses a missing V2 schema');
   await notV2.query('rollback');
+  await rejects(() => notV2.query(archiveMigration),/requires the V2 schema/,'archive migration refuses a missing V2 schema');
+  await notV2.query('rollback');
+  await rejects(() => notV2.query(reopenMigration),/requires the V2 schema/,'reopen migration refuses a missing V2 schema');
+  await notV2.query('rollback');
 
   // ---- Comment images (Supabase Storage). A minimal stand-in for Storage's
   // tables, with Supabase's grants: clients may touch storage.objects and only
@@ -887,7 +990,7 @@ try {
   await rejects(() => upload(yifan,image('Yifan')),/row-level security/,'a deactivated member cannot upload');
   await admin.query('update public.profiles set active=true where id=$1',[users.Yifan]);
 
-  console.log(`PASS: ${checks} PostgreSQL checks, including the 1 MiB description limit and its migration, notification read state and its migration, creator/PI idea deletion rules and their migration, threaded replies and their additive migration, concurrent participation, parallel independent results, comment idempotency, publication WAL filtering, parent-before-child deletion races, and the backup-verified single-transaction V1 upgrade. Hosted Supabase was not used.`);
+  console.log(`PASS: ${checks} PostgreSQL checks, including idea archiving and its migration, members reopening their own result and its migration, the 1 MiB description limit and its migration, notification read state and its migration, creator/PI idea deletion rules and their migration, threaded replies and their additive migration, concurrent participation, parallel independent results, comment idempotency, publication WAL filtering, parent-before-child deletion races, and the backup-verified single-transaction V1 upgrade. Hosted Supabase was not used.`);
 } finally {
   await Promise.allSettled(clients.map(client => client.end()));
   await db.stop(); await rm(directory,{recursive:true,force:true});

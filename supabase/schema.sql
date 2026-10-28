@@ -236,7 +236,7 @@ create table if not exists public.idea_events (
   event_type text not null check (event_type in (
     'created', 'edited', 'deleted',
     'joined', 'withdrew', 'rejoined', 'result_submitted', 'result_reopened', 'participant_updated',
-    'commented', 'comment_removed')),
+    'commented', 'comment_removed', 'archived', 'unarchived')),
   previous_state jsonb,
   new_state jsonb,
   created_at timestamptz not null default now()
@@ -321,16 +321,23 @@ $$;
 -- Audit triggers record snapshots in the SAME transaction as each mutation.
 -- Every participant/comment change therefore also inserts an idea_events row,
 -- which is what Realtime delivers to other members.
+-- >>> shared: audit_idea (identical in supabase/schema.sql and supabase/migrations/add_idea_archive.sql)
+-- Archiving and restoring are recorded as their own event types; every other
+-- idea update is an edit.
 create or replace function tracker_private.audit_idea()
 returns trigger language plpgsql security definer set search_path = '' as $$
 begin
   insert into public.idea_events(idea_id, idea_number, actor_id, event_type, previous_state, new_state)
   values (new.id, new.idea_number, tracker_private.current_actor(),
-    case when tg_op = 'INSERT' then 'created' else 'edited' end,
+    case when tg_op = 'INSERT' then 'created'
+      when old.archived_at is null and new.archived_at is not null then 'archived'
+      when old.archived_at is not null and new.archived_at is null then 'unarchived'
+      else 'edited' end,
     case when tg_op = 'INSERT' then null else to_jsonb(old) end, to_jsonb(new));
   return new;
 end;
 $$;
+-- <<< shared
 drop trigger if exists ideas_audit on public.ideas;
 create trigger ideas_audit after insert or update on public.ideas
   for each row execute function tracker_private.audit_idea();
@@ -515,13 +522,20 @@ begin
 end;
 $$;
 
+-- >>> shared: join_idea (identical in supabase/schema.sql and supabase/migrations/add_idea_archive.sql)
 -- Join, or rejoin after withdrawing. Each member only ever writes their own row.
+-- Archived ideas cannot be joined. archive_idea locks the idea FOR UPDATE, so
+-- the archive check below, made after this join's KEY SHARE lock, always sees
+-- an archive that committed first.
 create or replace function public.join_idea(p_idea_id uuid)
 returns public.idea_participants language plpgsql security definer set search_path = '' as $$
 declare v_row public.idea_participants;
 begin
   perform tracker_private.require_member();
   perform tracker_private.require_idea(p_idea_id);
+  if exists (select 1 from public.ideas where id = p_idea_id and archived_at is not null) then
+    raise exception 'This idea is archived';
+  end if;
   insert into public.idea_participants(idea_id, member_id) values (p_idea_id, auth.uid())
   on conflict (idea_id, member_id) do update set status = 'testing', joined_at = clock_timestamp()
     where public.idea_participants.status = 'withdrawn'
@@ -530,6 +544,7 @@ begin
   return v_row;
 end;
 $$;
+-- <<< shared
 
 create or replace function public.leave_idea(p_idea_id uuid, p_expected_revision bigint)
 returns public.idea_participants language plpgsql security definer set search_path = '' as $$
@@ -573,14 +588,19 @@ begin
 end;
 $$;
 
--- PI only: return one member's completed result to Testing so they can run it
--- again. The previous result stays in the activity history.
+-- >>> shared: reopen_result (identical in supabase/schema.sql and supabase/migrations/allow_member_reopen_own_result.sql)
+-- Return one member's completed result to Testing so it can be run again. The
+-- PI may reopen anyone's result; a member may reopen only their own. The
+-- previous result stays in the activity history.
 create or replace function public.reopen_result(
   p_idea_id uuid, p_member_id uuid, p_expected_revision bigint
 ) returns public.idea_participants language plpgsql security definer set search_path = '' as $$
-declare v_row public.idea_participants;
+declare v_row public.idea_participants; v_role text;
 begin
-  perform tracker_private.require_member(true);
+  v_role := tracker_private.require_member();
+  if v_role <> 'pi' and p_member_id is distinct from auth.uid() then
+    raise exception using errcode = '42501', message = 'Permission denied';
+  end if;
   v_row := tracker_private.lock_participation(p_idea_id, p_member_id, p_expected_revision);
   if v_row.status <> 'completed' then raise exception 'Invalid status transition'; end if;
   update public.idea_participants set status = 'testing', result = null, notes = null,
@@ -589,6 +609,7 @@ begin
   return v_row;
 end;
 $$;
+-- <<< shared
 
 -- Stores the Markdown exactly as submitted. Repeating the same client request
 -- ID returns the original comment instead of posting a duplicate.
@@ -753,6 +774,71 @@ on conflict (member_id) do nothing;
 alter table public.ideas drop constraint if exists ideas_description_check;
 alter table public.ideas add constraint ideas_description_check
   check (octet_length(description) <= 1048576);
+-- <<< shared
+
+-- >>> shared: idea archive (identical in supabase/schema.sql and supabase/migrations/add_idea_archive.sql)
+-- An idea the lab has given up on is archived rather than deleted: its text,
+-- results and discussion stay readable, but nobody can join it any more. The
+-- idea's creator or the PI archives it, optionally saying why, and can restore
+-- it. Written as idempotent ALTERs so the same statements upgrade an existing
+-- V2 database and build a fresh one.
+alter table public.ideas add column if not exists archived_at timestamptz;
+alter table public.ideas add column if not exists archived_by uuid references public.profiles(id) on delete restrict;
+alter table public.ideas add column if not exists archive_reason text;
+alter table public.ideas drop constraint if exists idea_archive_state;
+alter table public.ideas add constraint idea_archive_state check (
+  (archived_at is null and archived_by is null and archive_reason is null) or
+  (archived_at is not null and archived_by is not null and
+    (archive_reason is null or length(archive_reason) between 1 and 2000)));
+alter table public.idea_events drop constraint if exists idea_events_event_type_check;
+alter table public.idea_events add constraint idea_events_event_type_check check (event_type in (
+  'created', 'edited', 'deleted',
+  'joined', 'withdrew', 'rejoined', 'result_submitted', 'result_reopened', 'participant_updated',
+  'commented', 'comment_removed', 'archived', 'unarchived'));
+
+-- Archiving locks the idea FOR UPDATE, like deletion: it waits for in-flight
+-- joins (KEY SHARE) and holds new ones until it commits, after which join_idea
+-- sees the archive and refuses. Comments, results and edits stay allowed.
+create or replace function public.archive_idea(p_idea_id uuid, p_expected_revision bigint, p_reason text default null)
+returns public.ideas language plpgsql security definer set search_path = '' as $$
+declare v_idea public.ideas; v_role text;
+begin
+  v_role := tracker_private.require_member();
+  v_idea := tracker_private.lock_idea(p_idea_id, p_expected_revision, true);
+  if v_role <> 'pi' and v_idea.created_by is distinct from auth.uid() then
+    raise exception using errcode = '42501',
+      message = 'Permission denied: only the PI or the idea creator can archive this idea';
+  end if;
+  if v_idea.archived_at is not null then raise exception 'Idea already archived'; end if;
+  update public.ideas set archived_at = clock_timestamp(), archived_by = auth.uid(),
+    archive_reason = nullif(btrim(p_reason), '')
+  where id = p_idea_id returning * into v_idea;
+  return v_idea;
+end;
+$$;
+
+-- Restoring makes the idea joinable again. The archive (who, when, why) stays
+-- in the 'archived' event of the activity history.
+create or replace function public.unarchive_idea(p_idea_id uuid, p_expected_revision bigint)
+returns public.ideas language plpgsql security definer set search_path = '' as $$
+declare v_idea public.ideas; v_role text;
+begin
+  v_role := tracker_private.require_member();
+  v_idea := tracker_private.lock_idea(p_idea_id, p_expected_revision, false);
+  if v_role <> 'pi' and v_idea.created_by is distinct from auth.uid() then
+    raise exception using errcode = '42501',
+      message = 'Permission denied: only the PI or the idea creator can restore this idea';
+  end if;
+  if v_idea.archived_at is null then raise exception 'Idea is not archived'; end if;
+  update public.ideas set archived_at = null, archived_by = null, archive_reason = null
+  where id = p_idea_id returning * into v_idea;
+  return v_idea;
+end;
+$$;
+revoke all on function public.archive_idea(uuid, bigint, text) from public, anon, authenticated;
+revoke all on function public.unarchive_idea(uuid, bigint) from public, anon, authenticated;
+grant execute on function public.archive_idea(uuid, bigint, text) to authenticated;
+grant execute on function public.unarchive_idea(uuid, bigint) to authenticated;
 -- <<< shared
 
 -- Supabase Postgres Changes does not apply row-level RLS to DELETE events.

@@ -126,7 +126,19 @@ function perform(name,args) {
     ideas = ideas.filter(i=>i!==idea); participants = participants.filter(p=>p.idea_id!==idea.id); comments = comments.filter(c=>c.idea_id!==idea.id);
     record(idea,'deleted',before,null); return {data:null,error:null};
   }
+  if (name==='archive_idea' || name==='unarchive_idea') {
+    // Same rule as the database: the creator or the PI.
+    if (profiles.find(p=>p.id===currentId)?.role !== 'pi' && idea.created_by !== currentId) return {data:null,error:{code:'42501',message:'Permission denied: only the PI or the idea creator can archive this idea'}};
+    if (idea.revision!==args.p_expected_revision) return fail('Idea changed. Refresh and try again');
+    const archiving = name==='archive_idea';
+    if (archiving === !!idea.archived_at) return fail(archiving ? 'Idea already archived' : 'Idea is not archived');
+    const before = clone(idea);
+    Object.assign(idea,archiving ? {archived_at:'2026-10-16T14:00:00Z',archived_by:currentId,archive_reason:args.p_reason?.trim() || null} :
+      {archived_at:null,archived_by:null,archive_reason:null},{revision:idea.revision+1});
+    record(idea,archiving ? 'archived' : 'unarchived',before,idea); return ok(idea);
+  }
   if (name==='join_idea') {
+    if (idea.archived_at) return fail('This idea is archived');
     if (mine && mine.status!=='withdrawn') return fail('Already participating in this idea');
     const before = clone(mine);
     const joined = mine ? Object.assign(mine,{status:'testing',revision:mine.revision+1}) : participation(idea.id,currentId,{joined_at:'2026-10-16T14:00:00Z'});
@@ -146,6 +158,8 @@ function perform(name,args) {
     record(idea,name==='leave_idea' ? 'withdrew' : editing ? 'participant_updated' : 'result_submitted',before,mine,currentId); return ok(mine);
   }
   if (name==='reopen_result') {
+    // Same rule as the database: the PI reopens anyone's result, a member only their own.
+    if (profiles.find(p=>p.id===currentId)?.role !== 'pi' && args.p_member_id !== currentId) return {data:null,error:{code:'42501',message:'Permission denied'}};
     const target = participants.find(p=>p.idea_id===idea.id && p.member_id===args.p_member_id);
     if (!target) return fail('Participation not found');
     if (target.revision!==args.p_expected_revision) return fail('Participation changed. Refresh and try again');
@@ -358,6 +372,18 @@ try {
   await wait(()=>!app.state.pending && !d.getElementById('modal').open);await settled();
   check(calls.at(-1).args.p_idea_id,'idea-2','Yan submits on her own idea');
   check([rowOf('idea-1','member-0').result,rowOf('idea-2','member-1').result],['success','success'],'two members keep independent results');
+  // A member moves their own result back to Testing; never another member's.
+  check(labels(d.getElementById('ideas')).filter(l=>l==='Back to Testing').length,app.state.participants.filter(p=>p.member_id==='member-1' && p.status==='completed').length,'Back to Testing only on own completed rows');
+  press(card('IDEA-002'),'Edit my result');
+  check(text('modal-body').includes('use Back to Testing'),true,'the edit dialog points to Back to Testing');app.closeModal();
+  press(card('IDEA-002'),'Back to Testing');
+  check([text('modal-title'),text('modal-body').includes('previous result remains in activity history')],['Move your result back to Testing?',true],'confirmation explains that history keeps the result');
+  const yanDone=rowOf('idea-2','member-1');
+  submit();await wait(()=>!app.state.pending && !d.getElementById('modal').open);await settled();
+  check(calls.at(-1),{name:'reopen_result',args:{p_idea_id:'idea-2',p_member_id:'member-1',p_expected_revision:yanDone.revision}},'own reopen uses reopen_result for the caller');
+  check([rowOf('idea-2','member-1').status,labels(card('IDEA-002')).includes('Submit my result'),text('notifications').includes('You are back to Testing.')],['testing',true,true],'back to Testing and can submit again');
+  press(card('IDEA-002'),'Submit my result');d.querySelector('input[value=success]').checked=true;submit();
+  await wait(()=>!app.state.pending && !d.getElementById('modal').open);await settled();
   currentId='member-0';await app.loadCurrentUser(session());await settled();
 
   // ---- PI reopens exactly one member's result.
@@ -382,7 +408,7 @@ try {
   app.confirmAction('delete',created);submit();await wait(()=>!app.state.pending && !d.getElementById('modal').open);await settled();
   check(calls.at(-1).name,'delete_idea','delete RPC');check(app.state.ideas.length,4,'delete refetch');
   app.openHistory();await wait(()=>d.querySelectorAll('.history li').length>0);
-  for (const phrase of ['submitted a result','Synthetic notes','reopened Yan’s result','Yan synthetic success','left the idea','joined the idea','deleted the idea','Preserved: 0 participants'])
+  for (const phrase of ['submitted a result','Synthetic notes','reopened Yan’s result','moved their result back to Testing','Yan synthetic success','left the idea','joined the idea','deleted the idea','Preserved: 0 participants'])
     check(text('modal-body').includes(phrase),true,`history shows: ${phrase}`);
   app.closeModal();
 
@@ -755,6 +781,47 @@ try {
   ideas=ideas.filter(i=>!['idea-yan-commented','idea-yan-race'].includes(i.id));
   participants=participants.filter(p=>p.idea_id!=='idea-yan-race');comments=comments.filter(c=>c.id!=='comment-on-5001');
   await app.loadIdeas();
+
+  // ---- Archive: creator or PI; archived ideas are hidden by default, greyed when shown, and cannot be joined.
+  ideas.push({...base,id:'idea-dead',idea_number:5100,title:'Idea the lab gave up on',created_by:'member-1'});
+  participants.push(participation('idea-dead','member-2'));
+  currentId='member-1';await app.loadCurrentUser(session());await settled();
+  const statValue=kind=>d.querySelector(`.stat[data-kind=${kind}] .stat-value`).textContent;
+  const totalBefore=statValue('total');
+  check([ideaActions('IDEA-5100').includes('Archive'),ideaActions('IDEA-001').includes('Archive'),text('overview-scope')],[true,false,'All weeks · All ideas'],'the creator may archive; others\' ideas offer no Archive');
+  press(card('IDEA-5100').querySelector('[data-slot="actions"]'),'Archive');
+  check([text('modal-title'),text('modal-body').includes('restore it at any time')],['Archive IDEA-5100?',true],'archive dialog explains that it is reversible');
+  d.querySelector('#modal-body textarea').value='  Baseline already beats it  ';
+  submit();await wait(()=>!app.state.pending && !d.getElementById('modal').open);await settled();
+  check(calls.at(-1),{name:'archive_idea',args:{p_idea_id:'idea-dead',p_expected_revision:1,p_reason:'  Baseline already beats it  '}},'archive uses the archive RPC with the reason');
+  check([card('IDEA-5100'),app.filteredIdeas().some(i=>i.id==='idea-dead')],[undefined,false],'archived ideas are hidden by default');
+  check([statValue('total'),text('overview-scope')],[String(Number(totalBefore)-1),'All weeks · Active ideas · 1 archived'],'the overview counts active ideas and mentions the archived one');
+  setFilter('archive-filter','all');
+  const deadCard=card('IDEA-5100');
+  deadCard.open=true;deadCard.dispatchEvent(new w.Event('toggle'));await snapshot('archived.html');
+  check([deadCard.classList.contains('archived'),[...deadCard.querySelectorAll('summary .badge')].map(b=>b.textContent).includes('Archived'),
+    deadCard.querySelector('.archive-note').textContent.includes('Archived by Yan'),deadCard.querySelector('.archive-note p').textContent],[true,true,true,'Baseline already beats it'],'shown archived ideas are greyed, badged and say who archived them and why');
+  check([ideaActions('IDEA-5100').includes('Join idea'),ideaActions('IDEA-5100').includes('Restore'),ideaActions('IDEA-5100').includes('Archive')],[false,true,false],'no Join on an archived idea; Restore replaces Archive');
+  setFilter('archive-filter','only');
+  check([...app.filteredIdeas()].map(i=>i.id),['idea-dead'],'Archived only');
+  setFilter('status-filter','open');
+  check(app.filteredIdeas().length,0,'an archived idea is never Open');
+  click('clear-filters');
+  check([d.getElementById('archive-filter').value,!!card('IDEA-5100')],['',false],'Clear filters hides archived ideas again');
+  app.joinIdea(ideaById('idea-dead'));await settled();
+  check(text('notifications').includes('This idea has been archived, so it can no longer be joined.'),true,'a join refused by the server is explained');
+  currentId='member-2';await app.loadCurrentUser(session());await settled();await wait(()=>app.state.notifications.lastRead!==null);
+  setFilter('archive-filter','all');
+  check([ideaActions('IDEA-5100').includes('Restore'),ideaActions('IDEA-5100').includes('Archive')],[false,false],'a participant who did not publish it cannot restore it');
+  currentId='member-1';await client.rpc('unarchive_idea',{p_idea_id:'idea-dead',p_expected_revision:ideaById('idea-dead').revision});currentId='member-2';
+  await app.loadIdeas();await wait(()=>app.state.notifications.items[0]?.text==='Yan restored an idea you joined');
+  check([card('IDEA-5100').classList.contains('archived'),!!card('IDEA-5100').querySelector('.archive-note')],[false,false],'a restored idea is active again');
+  app.openHistory(ideaById('idea-dead'));await wait(()=>d.querySelectorAll('#modal-body .history li').length>=2);
+  check([...d.querySelectorAll('#modal-body .history li strong')].map(el=>el.textContent).slice(0,2),['IDEA-5100 · Yan restored the idea.','IDEA-5100 · Yan archived the idea.'],'history records archive and restore');
+  check([...d.querySelectorAll('#modal-body .history li .notes')].some(el=>el.textContent==='Baseline already beats it'),true,'history keeps the reason');
+  app.closeModal();click('clear-filters');
+  ideas=ideas.filter(i=>i.id!=='idea-dead');participants=participants.filter(p=>p.idea_id!=='idea-dead');
+  currentId='member-0';await app.loadCurrentUser(session());await settled();
 
   // ---- Notifications: derived from activity history; read position shared across devices.
   const bellCount=()=>d.getElementById('bell-count').hidden ? 0 : d.getElementById('bell-count').textContent;
