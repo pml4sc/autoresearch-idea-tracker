@@ -410,6 +410,9 @@ try {
   app.openHistory();await wait(()=>d.querySelectorAll('.history li').length>0);
   for (const phrase of ['submitted a result','Synthetic notes','reopened Yan’s result','moved their result back to Testing','Yan synthetic success','left the idea','joined the idea','deleted the idea','Preserved: 0 participants'])
     check(text('modal-body').includes(phrase),true,`history shows: ${phrase}`);
+  [...d.querySelectorAll('.history .history-jump')].find(b=>b.textContent.includes('deleted the idea')).click();
+  await wait(()=>text('modal-title').endsWith('· History') && d.querySelectorAll('.history li').length>0);
+  check([d.getElementById('modal').open,d.querySelectorAll('.history .history-jump').length],[true,0],'a deleted idea’s entry opens its own history, with nothing left to jump to');
   app.closeModal();
 
   // ---- Inline discussion under each idea: no modal, Markdown/LaTeX, drafts, paging.
@@ -598,7 +601,10 @@ try {
   w.confirm=()=>true;press(own(commentNode('IDEA-004',firstReply.id),'.reply-slot form'),'Cancel');
   app.openHistory(ideaById('idea-4'));await wait(()=>d.querySelectorAll('.history li').length>0);
   check(text('modal-body').includes('replied to Shibo’s comment'),true,'history shows replies');
-  app.closeModal();
+  [...d.querySelectorAll('.history .history-jump')].find(b=>b.textContent.includes('replied to Shibo’s comment')).click();
+  await wait(()=>!d.getElementById('modal').open && card('IDEA-004')?.open && card('IDEA-004').querySelector('li.comment.flash'));
+  const jumpedTo=comments.find(c=>c.id===card('IDEA-004').querySelector('li.comment.flash').dataset.commentId);
+  check(comments.find(c=>c.id===jumpedTo?.parent_comment_id)?.author_id,'member-0','a history entry jumps to its idea and highlights the reply');
 
   // ---- Author deletion at top level and deep in a mixed-author thread.
   currentId='member-2';await app.loadCurrentUser(session());await settled();
